@@ -1,85 +1,65 @@
 #!/usr/bin/env node
-import { createHash } from 'node:crypto';
-import { copyFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseManifest, prepareIllustration, validatePng, verifyImmutableAsset } from './illustration-validation.mjs';
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const manifestPath = resolve(repository, 'grocery-illustrations/manifest.json');
-const maximumBytes = 1_500_000;
-
 function usage(message) {
   if (message) console.error(message);
   console.error('Usage: node scripts/publish-grocery-illustration.mjs --id grocery-id --name "Grocery name" --aliases "alias one|alias two" --image /absolute/file.png [--dry-run]');
-  process.exit(2);
+  process.exitCode = 2;
 }
 
-const values = new Map();
-let dryRun = false;
-for (let index = 2; index < process.argv.length; index += 1) {
-  const argument = process.argv[index];
-  if (argument === '--dry-run') { dryRun = true; continue; }
-  if (!argument.startsWith('--') || index + 1 >= process.argv.length) usage(`Unexpected argument: ${argument}`);
-  values.set(argument.slice(2), process.argv[++index]);
+async function main() {
+  const values = new Map(); let dryRun = false;
+  for (let index = 2; index < process.argv.length; index += 1) {
+    const argument = process.argv[index];
+    if (argument === '--dry-run' && !dryRun) { dryRun = true; continue; }
+    if (!['--id', '--name', '--aliases', '--image'].includes(argument) || index + 1 >= process.argv.length
+      || values.has(argument.slice(2)) || process.argv[index + 1].startsWith('--')) throw Error(`Unexpected or repeated argument: ${argument}`);
+    values.set(argument.slice(2), process.argv[++index]);
+  }
+  const imagePath = values.get('image') ? resolve(values.get('image')) : '';
+  if (!imagePath) throw Error('A PNG path is required.');
+  // Read once: the bytes that pass validation are the bytes copied into the immutable asset.
+  const image = await readFile(imagePath); validatePng(image);
+  const metadata = { id: values.get('id'), name: values.get('name'),
+    aliases: (values.get('aliases') ?? '').split('|').map(value => value.trim()).filter(Boolean) };
+  let lock;
+  const lockPath = `${manifestPath}.lock`, temporaryManifest = `${manifestPath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    // Concurrent writers must re-read the current revision while holding this exclusive lock.
+    if (!dryRun) {
+      try { lock = await open(lockPath, 'wx', 0o600); }
+      catch (error) { if (error.code === 'EEXIST') throw Error('Another illustration update is active. Verify any stale manifest lock before retrying.'); throw error; }
+    }
+    const prepared = prepareIllustration(parseManifest(await readFile(manifestPath, 'utf8')), image, metadata);
+    const destination = resolve(repository, 'grocery-illustrations', prepared.entry.asset);
+    if (!prepared.changed) {
+      if (!(await lstat(destination)).isFile()) throw Error('The immutable asset must be a regular file.');
+      verifyImmutableAsset(await readFile(destination), image);
+      console.log(`${prepared.entry.id} is already published at revision ${prepared.manifest.revision}.`); return;
+    }
+    if (dryRun) { console.log(JSON.stringify({ destination, manifest: prepared.manifest }, null, 2)); return; }
+    await mkdir(dirname(destination), { recursive: true });
+    if (await realpath(dirname(destination)) !== dirname(destination)) throw Error('The asset directory must not be a symbolic link.');
+    try { await writeFile(destination, image, { flag: 'wx' }); }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      if (!(await lstat(destination)).isFile()) throw Error('The immutable asset must be a regular file.');
+      verifyImmutableAsset(await readFile(destination), image);
+    }
+    await writeFile(temporaryManifest, `${JSON.stringify(prepared.manifest, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+    await rename(temporaryManifest, manifestPath);
+    console.log(`Published ${prepared.entry.name} as ${prepared.entry.id}; catalog revision ${prepared.manifest.revision}.`);
+  } finally {
+    if (lock) {
+      try { await unlink(temporaryManifest).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+      finally { await lock.close(); await unlink(lockPath); }
+    }
+  }
 }
-
-const id = values.get('id')?.trim();
-const name = values.get('name')?.trim().replace(/\s+/g, ' ');
-const imagePath = values.get('image') ? resolve(values.get('image')) : '';
-const aliases = (values.get('aliases') ?? '').split('|').map(value => value.trim().replace(/\s+/g, ' ')).filter(Boolean);
-if (!id || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) usage('The ID must be a lowercase slug.');
-if (!name || name.length > 80) usage('The grocery name is required and must be at most 80 characters.');
-if (!imagePath) usage('An absolute or relative PNG path is required.');
-if (aliases.length > 40 || aliases.some(alias => alias.length > 80)) usage('Use at most 40 aliases of 80 characters each.');
-
-const image = await readFile(imagePath).catch(error => usage(`Could not read the PNG: ${error.message}`));
-if (!image || image.length < 8 || image.length > maximumBytes) usage(`The PNG must be between 8 and ${maximumBytes} bytes.`);
-if (!image.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) usage('The image is not a PNG.');
-
-const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-if (manifest.schemaVersion !== 1 || !Number.isSafeInteger(manifest.revision) || !Array.isArray(manifest.ingredients)) usage('The existing manifest is invalid.');
-const normalize = value => value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
-const uniqueAliases = [...new Map(aliases.map(alias => [normalize(alias), alias])).values()];
-const ownership = new Map();
-for (const entry of manifest.ingredients) {
-  if (entry.id === id) continue;
-  for (const phrase of [entry.name, ...entry.aliases]) ownership.set(normalize(phrase), entry.id);
-}
-for (const phrase of [name, ...uniqueAliases]) {
-  const owner = ownership.get(normalize(phrase));
-  if (owner) usage(`"${phrase}" already belongs to ${owner}.`);
-}
-
-const sha256 = createHash('sha256').update(image).digest('hex');
-const asset = `assets/${id}-${sha256.slice(0, 12)}.png`;
-const entry = { id, name, aliases: uniqueAliases, asset, sha256, bytes: image.length };
-const current = manifest.ingredients.find(value => value.id === id);
-if (current && JSON.stringify(current) === JSON.stringify(entry)) {
-  console.log(`${id} is already published at revision ${manifest.revision}.`);
-  process.exit(0);
-}
-
-const next = {
-  ...manifest,
-  revision: manifest.revision + 1,
-  updatedAt: new Date().toISOString(),
-  ingredients: [...manifest.ingredients.filter(value => value.id !== id), entry].sort((left, right) => left.name.localeCompare(right.name)),
-};
-const destination = resolve(repository, 'grocery-illustrations', asset);
-if (dryRun) {
-  console.log(JSON.stringify({ destination, manifest: next }, null, 2));
-  process.exit(0);
-}
-
-await mkdir(dirname(destination), { recursive: true });
-try {
-  const existing = await stat(destination);
-  if (existing.size !== image.length) usage(`Refusing to overwrite a different asset at ${destination}.`);
-} catch (error) {
-  if (error.code !== 'ENOENT') throw error;
-  await copyFile(imagePath, destination);
-}
-const temporaryManifest = `${manifestPath}.${process.pid}.tmp`;
-await writeFile(temporaryManifest, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
-await rename(temporaryManifest, manifestPath);
-console.log(`Published ${name} as ${id}; catalog revision ${next.revision}.`);
+main().catch(error => usage(error.message));
